@@ -210,9 +210,47 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
     return false;
 }
 
+// The largest image (RGBA8 bytes, all levels and layers) the uneven-mip RGBA8 rule below may keep
+// uncompressed. RGBA8 takes 4x BC3 and 8x BC1, so on 8 GB AMD cards the rule alone filled video
+// memory on OoT's Kokiri Forest load (a 1365x1365x90 array, ~0.9 GiB as RGBA8, next to ~64
+// 1536x1536 textures at ~12.6 MiB each) and the process died. Default: no limit on cards with 12
+// GiB or more of device-local memory (the old behaviour), off below (those images are
+// re-compressed to BC like on other vendors; distant terrain seams can show). Fixed per device so
+// an image always gets the same host format. EDEN_NX2_AMD_UNEVEN_RGBA8_MIB=<MiB> sets the limit
+// (0 = never keep RGBA8; a large value restores the old behaviour on any card).
+[[nodiscard]] u64 UnevenMipRgba8Limit(const Device& device) {
+    static const u64 limit = [&device] {
+        if (const char* value = std::getenv("EDEN_NX2_AMD_UNEVEN_RGBA8_MIB")) {
+            const u64 mib = std::strtoull(value, nullptr, 10);
+            LOG_INFO(Render_Vulkan,
+                     "EDEN_NX2_AMD_UNEVEN_RGBA8_MIB={}: uneven-mip ASTC is kept as RGBA8 up to {} "
+                     "MiB per image",
+                     mib, mib);
+            return mib << 20;
+        }
+        const bool large_card = device.GetDeviceLocalMemory() >= (u64{12} << 30);
+        LOG_INFO(Render_Vulkan,
+                 "Uneven-mip ASTC on AMD: {} ({} MiB of device-local memory; "
+                 "EDEN_NX2_AMD_UNEVEN_RGBA8_MIB sets the per-image limit)",
+                 large_card ? "kept as RGBA8" : "re-compressed to BC to save video memory",
+                 device.GetDeviceLocalMemory() >> 20);
+        return large_card ? ~u64{0} : u64{0};
+    }();
+    return limit;
+}
+
+[[nodiscard]] u64 AstcRgba8Bytes(const ImageInfo& info) {
+    u64 bytes = 0;
+    for (s32 level = 0; level < info.resources.levels; ++level) {
+        bytes += u64{(std::max)(info.size.width >> level, 1U)} *
+                 (std::max)(info.size.height >> level, 1U) * 4;
+    }
+    return bytes * (std::max)(info.resources.layers, 1);
+}
+
 // ASTC that would be re-compressed to BC1/BC3 but has uneven block mips (HasUnevenBlockMips) on
 // an AMD driver, which samples those wrong: kept as the GPU decoder's RGBA8 instead, like huge
-// arrays.
+// arrays, as long as it fits UnevenMipRgba8Limit.
 [[nodiscard]] bool IsUnevenMipRgba8Astc(const Device& device, const ImageInfo& info) {
     if (!IsPixelFormatASTC(info.format) || device.IsOptimalAstcSupported() ||
         info.type != ImageType::e2D || info.size.depth != 1 || info.resources.levels <= 1 ||
@@ -225,7 +263,8 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
         id != VK_DRIVER_ID_MESA_RADV) {
         return false;
     }
-    return HasUnevenBlockMips(info) && !IsHugeAstcArray(device, info);
+    return HasUnevenBlockMips(info) && !IsHugeAstcArray(device, info) &&
+           AstcRgba8Bytes(info) <= UnevenMipRgba8Limit(device);
 }
 
 // A large image over Switch 2 sparse blocks nobody has written (title 1's terrain layer pools, 2.9
