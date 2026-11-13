@@ -79,7 +79,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Fork test builds: Windows only (the platform being tested).
+          # Fork test builds: Windows only (the platform being tested: RX 7600, 8 GB).
           - platform: windows-x86_64
             runner: windows-2022
           - platform: windows-x86_64-pgo
